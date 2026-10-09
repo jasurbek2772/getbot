@@ -1,6 +1,6 @@
 import os
-import io
 import json
+import time
 import asyncio
 import logging
 import traceback
@@ -32,6 +32,9 @@ TARGET = int(_target) if _target.lstrip("-").isdigit() else _target
 
 BOT_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+CONNECT_TIMEOUT = 20   # сек на подключение к Telegram
+JOB_TIMEOUT = 50       # сек на всю задачу (maxDuration в vercel.json = 60)
+
 INTRO = (
     "👋 Привет!\n\n"
     "Я скачиваю материалы целевого пользователя через твой аккаунт "
@@ -41,6 +44,8 @@ INTRO = (
     "• 🎥 Аватар (гиф/видео): видеоаватарка, если есть\n"
     "• 📌 Закреп сторис: закреплённые истории\n"
     "• 📲 Текущие сторис: активные истории\n\n"
+    "Во время работы я пишу статус по шагам.\n"
+    "/status: проверка сессии и webhook.\n"
     "Файлы приходят документами, чтобы Telegram не сжимал качество."
 )
 
@@ -53,21 +58,29 @@ KEYBOARD = {
     ]
 }
 
+TITLES = {
+    "avatar": "🖼 Скачивание аватара",
+    "avatar_video": "🎥 Скачивание видеоаватарки",
+    "stories_pinned": "📌 Скачивание закрепов",
+    "stories_current": "📲 Скачивание текущих сторис",
+    "status": "🔎 Проверка",
+}
+
 
 # ================= BOT API HELPERS =================
 async def bot_call(http, method, data=None, files=None):
-    r = await http.post(f"{BOT_API}/{method}", data=data, files=files, timeout=120)
     try:
+        r = await http.post(f"{BOT_API}/{method}", data=data, files=files, timeout=60)
         res = r.json()
-    except Exception:
-        res = {"ok": False, "description": r.text[:200]}
+    except Exception as e:
+        res = {"ok": False, "description": f"{type(e).__name__}: {e}"}
     if not res.get("ok"):
         log.error("Bot API %s error: %s", method, res)
     return res
 
 
 async def send_text(http, text, keyboard=None):
-    data = {"chat_id": MY_CHAT_ID, "text": text}
+    data = {"chat_id": MY_CHAT_ID, "text": text[:4000]}
     if keyboard:
         data["reply_markup"] = json.dumps(keyboard)
     return await bot_call(http, "sendMessage", data=data)
@@ -87,6 +100,33 @@ async def send_file(http, name, content: bytes, caption="", as_video=False):
     return await bot_call(http, method, data=data, files={field: (name, content)})
 
 
+class Status:
+    """Одно сообщение в чате, которое редактируется по ходу работы."""
+
+    def __init__(self, http, title):
+        self.http = http
+        self.title = title
+        self.lines = []
+        self.mid = None
+        self.t0 = time.monotonic()
+
+    async def add(self, line):
+        elapsed = time.monotonic() - self.t0
+        self.lines.append(f"[{elapsed:4.1f}с] {line}")
+        text = self.title + "\n\n" + "\n".join(self.lines[-15:])
+        if self.mid is None:
+            res = await bot_call(
+                self.http, "sendMessage", data={"chat_id": MY_CHAT_ID, "text": text}
+            )
+            self.mid = (res.get("result") or {}).get("message_id")
+        else:
+            await bot_call(
+                self.http,
+                "editMessageText",
+                data={"chat_id": MY_CHAT_ID, "message_id": self.mid, "text": text},
+            )
+
+
 # ================= TELETHON HELPERS =================
 def make_client():
     return TelegramClient(
@@ -97,13 +137,17 @@ def make_client():
     )
 
 
-async def get_target(client):
+async def get_target(client, st):
+    await st.add("🔍 Ищу целевого пользователя...")
     try:
-        return await client.get_input_entity(TARGET)
+        peer = await client.get_input_entity(TARGET)
     except ValueError:
-        # в StringSession нет кэша — подгружаем диалоги и пробуем снова
+        await st.add("↻ Нет в кэше, загружаю диалоги...")
         await client.get_dialogs()
-        return await client.get_input_entity(TARGET)
+        peer = await client.get_input_entity(TARGET)
+    user = await client.get_entity(peer)
+    await st.add(f"✔ Пользователь найден: {user.first_name or '-'}")
+    return peer, user
 
 
 def user_info(user, title):
@@ -118,108 +162,128 @@ def user_info(user, title):
 
 
 # ================= JOBS =================
-async def job_avatar(client, http):
-    peer = await get_target(client)
-    user = await client.get_entity(peer)
+async def job_status(client, http, st):
+    me = await client.get_me()
+    await st.add(f"✔ Сессия: {me.first_name} (id {me.id}, бот: {me.bot})")
+    await get_target(client, st)
+    info = await bot_call(http, "getWebhookInfo")
+    wh = info.get("result", {})
+    await st.add(f"Webhook: {wh.get('url')}")
+    await st.add(f"allowed_updates: {wh.get('allowed_updates', 'по умолчанию')}")
+    await st.add(f"pending: {wh.get('pending_update_count')}")
+    await st.add(f"last_error: {wh.get('last_error_message', '-')}")
+
+
+async def job_avatar(client, http, st):
+    peer, user = await get_target(client, st)
+
+    await st.add("📋 Получаю список фото профиля...")
     photos = await client.get_profile_photos(peer)
-
     if not photos:
-        await send_text(http, "У пользователя нет фото профиля.")
+        await st.add("⚠ У пользователя нет фото профиля.")
         return
-
+    await st.add(f"✔ Найдено фото: {len(photos)}")
     await send_text(http, user_info(user, f"🖼 Фото профиля (всего: {len(photos)})"))
 
     for i, p in enumerate(photos, start=1):
+        await st.add(f"⬇ Скачиваю {i}/{len(photos)}...")
         try:
             data = await client.download_media(p, file=bytes)
         except RPCError as e:
-            await send_text(http, f"Ошибка скачивания фото {i}: {e}")
+            await st.add(f"❌ Фото {i}: ошибка Telegram ({e})")
             continue
         if not data:
-            await send_text(http, f"Не удалось скачать фото {i}")
+            await st.add(f"❌ Фото {i}: не удалось скачать")
             continue
-        await send_file(http, f"profile_{i}.jpg", data, caption=f"🖼 Фото {i}/{len(photos)}")
+        await st.add(f"⬆ Отправляю {i}/{len(photos)} ({len(data) // 1024} КБ)...")
+        res = await send_file(http, f"profile_{i}.jpg", data, caption=f"🖼 Фото {i}/{len(photos)}")
+        if not res.get("ok"):
+            await st.add(f"❌ Фото {i}: не отправилось ({res.get('description')})")
         await asyncio.sleep(0.5)
 
 
-async def job_avatar_video(client, http):
-    peer = await get_target(client)
-    user = await client.get_entity(peer)
-    full = await client(GetFullUserRequest(id=peer))
+async def job_avatar_video(client, http, st):
+    peer, user = await get_target(client, st)
 
+    await st.add("📋 Проверяю видеоаватарку...")
+    full = await client(GetFullUserRequest(id=peer))
     photo = getattr(full.full_user, "profile_photo", None)
     video_sizes = getattr(photo, "video_sizes", None)
 
     if not photo or not video_sizes:
-        await send_text(http, "У пользователя нет видеоаватарки (гиф).")
+        await st.add("⚠ У пользователя нет видеоаватарки (гиф).")
         return
 
     best = max(video_sizes, key=lambda v: getattr(v, "w", 0) or 0)
+    await st.add(f"⬇ Скачиваю видео ({getattr(best, 'w', '?')}x{getattr(best, 'h', '?')})...")
     data = await client.download_media(photo, file=bytes, thumb=best)
-
     if not data:
-        await send_text(http, "Не удалось скачать видеоаватарку.")
+        await st.add("❌ Не удалось скачать видеоаватарку.")
         return
 
+    await st.add(f"⬆ Отправляю ({len(data) // 1024} КБ)...")
     await send_text(http, user_info(user, "🎥 Видеоаватарка"))
-    await send_file(http, "profile_video.mp4", data, caption="🎥 Видеоаватарка", as_video=True)
+    res = await send_file(http, "profile_video.mp4", data, caption="🎥 Видеоаватарка", as_video=True)
+    if not res.get("ok"):
+        await st.add(f"❌ Не отправилось ({res.get('description')})")
 
 
-async def _send_stories(client, http, stories, title, prefix):
+async def _send_stories(client, http, st, stories, title, prefix):
     media = [s for s in stories if getattr(s, "media", None)]
     if not media:
-        await send_text(http, f"{title}: нет доступных историй.")
+        await st.add("⚠ Нет доступных историй.")
         return
 
-    await send_text(http, f"{title}: найдено {len(media)}")
+    await st.add(f"✔ Найдено историй: {len(media)}")
 
-    for story in media:
+    for n, story in enumerate(media, start=1):
+        await st.add(f"⬇ Скачиваю {n}/{len(media)} (id {story.id})...")
         try:
             data = await client.download_media(story.media, file=bytes)
         except RPCError as e:
-            await send_text(http, f"Story {story.id}: ошибка скачивания ({e})")
+            await st.add(f"❌ Story {story.id}: ошибка Telegram ({e})")
             continue
         if not data:
-            await send_text(http, f"Story {story.id}: не удалось скачать")
+            await st.add(f"❌ Story {story.id}: не удалось скачать")
             continue
 
         ext = "mp4" if hasattr(story.media, "document") else "jpg"
+        await st.add(f"⬆ Отправляю {n}/{len(media)} ({len(data) // 1024} КБ)...")
         res = await send_file(
             http, f"story_{story.id}.{ext}", data, caption=f"{prefix} Story {story.id}"
         )
         if not res.get("ok"):
-            await send_text(
-                http,
-                f"Story {story.id}: не удалось отправить "
-                f"({res.get('description', 'возможно, файл больше 50 МБ')})",
+            await st.add(
+                f"❌ Story {story.id}: не отправилось "
+                f"({res.get('description', 'возможно, файл больше 50 МБ')})"
             )
         await asyncio.sleep(1)
 
 
-async def job_stories_current(client, http):
-    peer = await get_target(client)
-    user = await client.get_entity(peer)
+async def job_stories_current(client, http, st):
+    peer, user = await get_target(client, st)
+    await st.add("📋 Запрашиваю текущие сторис...")
     try:
         result = await client(GetPeerStoriesRequest(peer=peer))
     except RPCError as e:
-        await send_text(http, f"Ошибка Telegram: {e}")
+        await st.add(f"❌ Ошибка Telegram: {e}")
         return
     stories = getattr(getattr(result, "stories", None), "stories", None) or []
     await send_text(http, user_info(user, "📲 Текущие сторис"))
-    await _send_stories(client, http, stories, "📲 Текущие сторис", "📲")
+    await _send_stories(client, http, st, stories, "📲 Текущие сторис", "📲")
 
 
-async def job_stories_pinned(client, http):
-    peer = await get_target(client)
-    user = await client.get_entity(peer)
+async def job_stories_pinned(client, http, st):
+    peer, user = await get_target(client, st)
+    await st.add("📋 Запрашиваю закреплённые сторис...")
     try:
         result = await client(GetPinnedStoriesRequest(peer=peer, offset_id=0, limit=100))
     except RPCError as e:
-        await send_text(http, f"Ошибка Telegram: {e}")
+        await st.add(f"❌ Ошибка Telegram: {e}")
         return
     stories = getattr(result, "stories", None) or []
     await send_text(http, user_info(user, "📌 Закреплённые сторис"))
-    await _send_stories(client, http, stories, "📌 Закреплённые сторис", "📌")
+    await _send_stories(client, http, st, stories, "📌 Закреплённые сторис", "📌")
 
 
 JOBS = {
@@ -227,24 +291,43 @@ JOBS = {
     "avatar_video": job_avatar_video,
     "stories_pinned": job_stories_pinned,
     "stories_current": job_stories_current,
+    "status": job_status,
 }
 
 
-# ================= UPDATE PROCESSING =================
+# ================= RUNNER =================
 async def run_job(action, http):
+    st = Status(http, TITLES.get(action, action))
+    await st.add("▶ Запуск")
     client = make_client()
     try:
-        await client.connect()
+        await st.add("🔌 Подключаюсь к Telegram...")
+        await asyncio.wait_for(client.connect(), CONNECT_TIMEOUT)
+
         if not await client.is_user_authorized():
-            await send_text(http, "❌ SESSION_STRING недействителен. Сгенерируй заново.")
+            await st.add("❌ SESSION_STRING недействителен. Сгенерируй заново и обнови в Vercel.")
             return
-        await JOBS[action](client, http)
-        await send_text(http, "✅ Готово", keyboard=KEYBOARD)
+        await st.add("✔ Подключено")
+
+        await asyncio.wait_for(JOBS[action](client, http, st), JOB_TIMEOUT)
+        await st.add("✅ Готово")
+
+    except asyncio.TimeoutError:
+        await st.add(
+            "⏱ Превышено время ожидания. Либо Telegram отвечает медленно, "
+            "либо файлы слишком большие для лимита функции Vercel."
+        )
     except Exception as e:
         log.error(traceback.format_exc())
-        await send_text(http, f"❌ Ошибка: {type(e).__name__}: {e}", keyboard=KEYBOARD)
+        tb = traceback.format_exc().strip().splitlines()[-3:]
+        await st.add(f"❌ Ошибка: {type(e).__name__}: {e}")
+        await st.add("Детали:\n" + "\n".join(tb))
     finally:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await send_text(http, "Выбери действие:", keyboard=KEYBOARD)
 
 
 async def process_update(update):
@@ -252,15 +335,24 @@ async def process_update(update):
         # --- нажатие кнопки ---
         cq = update.get("callback_query")
         if cq:
-            chat_id = cq.get("message", {}).get("chat", {}).get("id")
-            from_id = cq.get("from", {}).get("id")
-            if MY_CHAT_ID not in (chat_id, from_id):
-                return
-            await bot_call(http, "answerCallbackQuery",
-                           data={"callback_query_id": cq["id"], "text": "⏳ Работаю..."})
+            chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
+            from_id = (cq.get("from") or {}).get("id")
             action = cq.get("data")
-            if action in JOBS:
-                await run_job(action, http)
+            log.info("callback: action=%s chat=%s from=%s", action, chat_id, from_id)
+
+            if MY_CHAT_ID not in (chat_id, from_id):
+                await bot_call(http, "answerCallbackQuery",
+                               data={"callback_query_id": cq["id"], "text": "⛔ Нет доступа"})
+                return
+
+            if action not in JOBS:
+                await bot_call(http, "answerCallbackQuery",
+                               data={"callback_query_id": cq["id"], "text": "Неизвестная кнопка"})
+                return
+
+            await bot_call(http, "answerCallbackQuery",
+                           data={"callback_query_id": cq["id"], "text": "⏳ Принято, работаю..."})
+            await run_job(action, http)
             return
 
         # --- сообщение ---
@@ -273,6 +365,8 @@ async def process_update(update):
         text = (msg.get("text") or "").strip()
         if text.startswith("/start") or text.startswith("/menu"):
             await send_text(http, INTRO, keyboard=KEYBOARD)
+        elif text.startswith("/status"):
+            await run_job("status", http)
         else:
             await send_text(http, "Выбери действие:", keyboard=KEYBOARD)
 
@@ -297,6 +391,7 @@ class handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             update = json.loads(self.rfile.read(length) or b"{}")
+            log.info("update keys: %s", list(update.keys()))
             asyncio.run(process_update(update))
         except Exception:
             log.error(traceback.format_exc())
