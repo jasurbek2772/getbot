@@ -360,14 +360,42 @@ async def job_link(client, http, st, channel, msg_id):
     await st.add(f"✔ Канал: {title}")
     await st.add(f"📥 Получаю пост #{msg_id}...")
 
-    msgs = await client.get_messages(entity, ids=msg_id)
-    msg  = msgs if not isinstance(msgs, list) else (msgs[0] if msgs else None)
+    # Получаем само сообщение
+    fetched = await client.get_messages(entity, ids=msg_id)
+    msg = fetched if not isinstance(fetched, list) else (fetched[0] if fetched else None)
 
     if not msg:
         await st.add("❌ Пост не найден. Возможно, удалён или нет доступа.")
         return
 
-    await forward_media(client, msg, http, st)
+    gid = msg.grouped_id
+
+    # Одиночный пост
+    if not gid:
+        await forward_media(client, msg, http, st)
+        return
+
+    # Альбом — берём соседние сообщения и фильтруем по grouped_id
+    await st.add(f"🗂 Альбом (grouped_id={gid}), ищу все части...")
+
+    # Берём 20 сообщений вокруг нужного — с запасом
+    around = await client.get_messages(entity, min_id=msg_id - 15, max_id=msg_id + 15)
+    album  = sorted(
+        [m for m in around if m and m.grouped_id == gid],
+        key=lambda m: m.id,
+    )
+
+    if not album:
+        # На крайний случай — хотя бы само сообщение
+        album = [msg]
+
+    await st.add(f"✔ Частей в альбоме: {len(album)}")
+
+    for i, part in enumerate(album, start=1):
+        await st.add(f"📄 Часть {i}/{len(album)}...")
+        await forward_media(client, part, http, st)
+        await asyncio.sleep(0.5)
+
 
 
 # ================= JOBS (кнопки) =================
