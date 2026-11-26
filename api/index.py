@@ -352,6 +352,7 @@ async def job_link(client, http, st, channel, msg_id):
     try:
         entity = await client.get_entity(channel)
     except ValueError:
+        await st.add("↻ Нет в кэше, загружаю диалоги...")
         await client.get_dialogs()
         entity = await client.get_entity(channel)
 
@@ -363,42 +364,88 @@ async def job_link(client, http, st, channel, msg_id):
     msg = fetched if not isinstance(fetched, list) else (fetched[0] if fetched else None)
 
     if not msg:
-        await st.add("❌ Пост не найден.")
+        await st.add("❌ Пост не найден. Возможно, удалён или нет доступа.")
         return
 
+    # ── Новая карусель (RichMessage + PageBlockSlideshow) ────────────
     rich = getattr(msg, "rich_message", None)
-    if not rich:
-        await st.add("rich_message отсутствует")
+    if rich:
+        photos = getattr(rich, "photos", []) or []
+        docs   = getattr(rich, "documents", []) or []
+        items  = photos + docs
+
+        # Текст из caption первого блока
+        cap_text = ""
+        for block in (getattr(rich, "blocks", []) or []):
+            try:
+                cap_text = block.caption.text.text or ""
+                if cap_text:
+                    break
+            except Exception:
+                pass
+
+        if not items:
+            # Только текст
+            await send_text(http, f"📄 пост #{msg_id}\n\n{cap_text}".strip())
+            await st.add("✔ Текстовый пост отправлен")
+            return
+
+        total = len(items)
+        await st.add(f"🎠 Карусель: {total} элементов")
+        if cap_text:
+            await send_text(http, f"📢 пост #{msg_id}\n\n{cap_text}")
+
+        for i, item in enumerate(items, start=1):
+            await st.add(f"⬇ Скачиваю {i}/{total}...")
+            try:
+                raw = await client.download_media(item, file=bytes)
+            except Exception as e:
+                await st.add(f"❌ Элемент {i}: {e}")
+                continue
+
+            if not raw:
+                await st.add(f"❌ Элемент {i}: пустой файл")
+                continue
+
+            cap   = f"🎠 {i}/{total}"
+            mime  = getattr(item, "mime_type", "") or ""
+            await st.add(f"⬆ Отправляю {i}/{total} ({len(raw)//1024} КБ)...")
+
+            if mime.startswith("video/"):
+                res = await send_file(http, "sendVideo", "video",
+                                      raw, f"carousel_{i}.mp4", caption=cap,
+                                      extra={"supports_streaming": "true"})
+                if not res.get("ok"):
+                    await send_doc(http, raw, f"carousel_{i}.mp4", caption=cap)
+            else:
+                res = await send_file(http, "sendPhoto", "photo",
+                                      raw, f"carousel_{i}.jpg", caption=cap)
+                if not res.get("ok"):
+                    await send_doc(http, raw, f"carousel_{i}.jpg", caption=cap)
+
+            await asyncio.sleep(0.5)
         return
 
-    await st.add(f"rich_message type: {type(rich).__name__}")
+    # ── Старый альбом (grouped_id) ───────────────────────────────────
+    gid = msg.grouped_id
+    if gid:
+        await st.add(f"🗂 Альбом, ищу все части...")
+        around = await client.get_messages(entity, min_id=msg_id - 15, max_id=msg_id + 15)
+        album  = sorted(
+            [m for m in around if m and m.grouped_id == gid],
+            key=lambda m: m.id,
+        )
+        if not album:
+            album = [msg]
+        await st.add(f"✔ Частей: {len(album)}")
+        for i, part in enumerate(album, start=1):
+            await st.add(f"📄 Часть {i}/{len(album)}...")
+            await forward_media(client, part, http, st)
+            await asyncio.sleep(0.5)
+        return
 
-    # Все атрибуты rich_message
-    lines = []
-    for attr in vars(rich):
-        if attr.startswith("_"):
-            continue
-        val = getattr(rich, attr, None)
-        lines.append(f"{attr}: {type(val).__name__} = {str(val)[:80]}")
-    await st.add("rich attrs:\n" + "\n".join(lines))
-
-    # Если внутри есть список — смотрим первый элемент
-    for attr in vars(rich):
-        if attr.startswith("_"):
-            continue
-        val = getattr(rich, attr, None)
-        if isinstance(val, list) and val:
-            await st.add(f"\nrich.{attr}[0] type: {type(val[0]).__name__}")
-            sub_lines = []
-            if hasattr(val[0], "__dict__"):
-                for k in vars(val[0]):
-                    if k.startswith("_"):
-                        continue
-                    v = getattr(val[0], k, None)
-                    sub_lines.append(f"  {k}: {type(v).__name__} = {str(v)[:60]}")
-            await st.add("\n".join(sub_lines))
-
-
+    # ── Одиночный пост ───────────────────────────────────────────────
+    await forward_media(client, msg, http, st)
 
 
 
