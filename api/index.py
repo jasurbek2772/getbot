@@ -352,7 +352,6 @@ async def job_link(client, http, st, channel, msg_id):
     try:
         entity = await client.get_entity(channel)
     except ValueError:
-        await st.add("↻ Нет в кэше, загружаю диалоги...")
         await client.get_dialogs()
         entity = await client.get_entity(channel)
 
@@ -367,30 +366,38 @@ async def job_link(client, http, st, channel, msg_id):
         await st.add("❌ Пост не найден.")
         return
 
-    # ── DEBUG: показываем всё что есть в сообщении ──
-    await st.add(f"media: {type(msg.media).__name__}")
-    await st.add(f"grouped_id: {msg.grouped_id}")
+    rich = getattr(msg, "rich_message", None)
+    if not rich:
+        await st.add("rich_message отсутствует")
+        return
 
-    # Все нестандартные атрибуты
-    interesting = []
-    for attr in vars(msg):
+    await st.add(f"rich_message type: {type(rich).__name__}")
+
+    # Все атрибуты rich_message
+    lines = []
+    for attr in vars(rich):
         if attr.startswith("_"):
             continue
-        val = getattr(msg, attr, None)
-        if val is not None and val is not False and val != [] and val != "":
-            interesting.append(f"{attr}: {type(val).__name__}")
-    await st.add("Атрибуты:\n" + "\n".join(interesting))
+        val = getattr(rich, attr, None)
+        lines.append(f"{attr}: {type(val).__name__} = {str(val)[:80]}")
+    await st.add("rich attrs:\n" + "\n".join(lines))
 
-    # Если media есть — показываем его атрибуты
-    if msg.media:
-        media_attrs = []
-        for attr in vars(msg.media):
-            if attr.startswith("_"):
-                continue
-            val = getattr(msg.media, attr, None)
-            if val is not None and val is not False and val != []:
-                media_attrs.append(f"  media.{attr}: {type(val).__name__} = {str(val)[:60]}")
-        await st.add("Media атрибуты:\n" + "\n".join(media_attrs))
+    # Если внутри есть список — смотрим первый элемент
+    for attr in vars(rich):
+        if attr.startswith("_"):
+            continue
+        val = getattr(rich, attr, None)
+        if isinstance(val, list) and val:
+            await st.add(f"\nrich.{attr}[0] type: {type(val[0]).__name__}")
+            sub_lines = []
+            if hasattr(val[0], "__dict__"):
+                for k in vars(val[0]):
+                    if k.startswith("_"):
+                        continue
+                    v = getattr(val[0], k, None)
+                    sub_lines.append(f"  {k}: {type(v).__name__} = {str(v)[:60]}")
+            await st.add("\n".join(sub_lines))
+
 
 
 
