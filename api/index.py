@@ -364,69 +364,33 @@ async def job_link(client, http, st, channel, msg_id):
     msg = fetched if not isinstance(fetched, list) else (fetched[0] if fetched else None)
 
     if not msg:
-        await st.add("❌ Пост не найден. Возможно, удалён или нет доступа.")
+        await st.add("❌ Пост не найден.")
         return
 
-    # ── Новая карусель (один пост, несколько фото/видео внутри) ──
-    alt_docs = getattr(msg, "alt_documents", None) or []
-    if alt_docs:
-        total = 1 + len(alt_docs)
-        await st.add(f"🎠 Карусель: {total} элементов")
+    # ── DEBUG: показываем всё что есть в сообщении ──
+    await st.add(f"media: {type(msg.media).__name__}")
+    await st.add(f"grouped_id: {msg.grouped_id}")
 
-        # Главный элемент
-        await st.add(f"📄 Элемент 1/{total}...")
-        await forward_media(client, msg, http, st)
-        await asyncio.sleep(0.5)
+    # Все нестандартные атрибуты
+    interesting = []
+    for attr in vars(msg):
+        if attr.startswith("_"):
+            continue
+        val = getattr(msg, attr, None)
+        if val is not None and val is not False and val != [] and val != "":
+            interesting.append(f"{attr}: {type(val).__name__}")
+    await st.add("Атрибуты:\n" + "\n".join(interesting))
 
-        # Дополнительные элементы из alt_documents
-        for i, doc in enumerate(alt_docs, start=2):
-            await st.add(f"📄 Элемент {i}/{total}...")
-            try:
-                raw = await client.download_media(doc, file=bytes)
-                if not raw:
-                    await st.add(f"❌ Элемент {i}: пустой файл")
-                    continue
-
-                mime  = getattr(doc, "mime_type", "") or ""
-                cap   = f"🎠 {i}/{total}"
-
-                if mime.startswith("video/"):
-                    res = await send_file(http, "sendVideo", "video",
-                                          raw, f"carousel_{i}.mp4", caption=cap,
-                                          extra={"supports_streaming": "true"})
-                    if not res.get("ok"):
-                        await send_doc(http, raw, f"carousel_{i}.mp4", caption=cap)
-                else:
-                    res = await send_file(http, "sendPhoto", "photo",
-                                          raw, f"carousel_{i}.jpg", caption=cap)
-                    if not res.get("ok"):
-                        await send_doc(http, raw, f"carousel_{i}.jpg", caption=cap)
-
-            except Exception as e:
-                await st.add(f"❌ Элемент {i}: {e}")
-            await asyncio.sleep(0.5)
-        return
-
-    # ── Старый альбом (grouped_id — несколько отдельных сообщений) ──
-    gid = msg.grouped_id
-    if gid:
-        await st.add(f"🗂 Альбом (grouped_id={gid}), ищу все части...")
-        around = await client.get_messages(entity, min_id=msg_id - 15, max_id=msg_id + 15)
-        album  = sorted(
-            [m for m in around if m and m.grouped_id == gid],
-            key=lambda m: m.id,
-        )
-        if not album:
-            album = [msg]
-        await st.add(f"✔ Частей в альбоме: {len(album)}")
-        for i, part in enumerate(album, start=1):
-            await st.add(f"📄 Часть {i}/{len(album)}...")
-            await forward_media(client, part, http, st)
-            await asyncio.sleep(0.5)
-        return
-
-    # ── Одиночный пост ───────────────────────────────────────────────
-    await forward_media(client, msg, http, st)
+    # Если media есть — показываем его атрибуты
+    if msg.media:
+        media_attrs = []
+        for attr in vars(msg.media):
+            if attr.startswith("_"):
+                continue
+            val = getattr(msg.media, attr, None)
+            if val is not None and val is not False and val != []:
+                media_attrs.append(f"  media.{attr}: {type(val).__name__} = {str(val)[:60]}")
+        await st.add("Media атрибуты:\n" + "\n".join(media_attrs))
 
 
 
